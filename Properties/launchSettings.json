@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "BybitOptionsProbabilityCalculator": {
+      "commandName": "Project"
+    },
+    "Container (Dockerfile)": {
+      "commandName": "Docker"
+    }
+  }
+}
