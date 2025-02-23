@@ -8,6 +8,9 @@ using ScottPlot.Statistics;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
+using System.Xml.Serialization;
+using Newtonsoft.Json;
 
 namespace BybitOptionsProbabilityCalculator
 {
@@ -21,7 +24,7 @@ namespace BybitOptionsProbabilityCalculator
             // init REST client
             rest = new BybitRestClient();
 
-            string coin = Prompt("Enter the coin (ex. BTC, ETH, SOL)");
+            string coin = Prompt("Enter the coin (ex. BTC, ETH, SOL)").ToUpper();
 
             var sorted = await UpdateOptionsAndTickerAsync(coin);
 
@@ -122,11 +125,27 @@ namespace BybitOptionsProbabilityCalculator
                     RC();
                 }
                 Console.WriteLine();
-                Console.WriteLine("Press ENTER to return to datetime selection.");
                 Console.WriteLine("Conclusions drawn...");
-                Console.WriteLine("The most likely price ranges based on P(D)%... GENERATING CHART");
-                GeneratePriceRangeLikelihood(options, false);
-                GeneratePriceRangeLikelihood(options, true);
+                //Console.WriteLine("The most likely price ranges based on P(D)%... GENERATING CHARTS");
+                var settlement = GeneratePriceRangeLikelihood(options, false);
+                var touch = GeneratePriceRangeLikelihood(options, true);
+                Console.WriteLine($"Settlement KDE: ${settlement.kdeEstimation} ({DiffPerc((double)underlyingPrice, settlement.kdeEstimation)}%), touch KDE: ${touch.kdeEstimation} ({DiffPerc((double)underlyingPrice, touch.kdeEstimation)}%)");
+
+                /*
+                // find extrema for KDE and print the price points out
+                var significantE = FindSignificantExtrema(settlement.kdeValues);
+                // map extrema to xValues
+                var SEindex = significantE.Select(x => x.index).ToArray();
+                Console.WriteLine($"Significant points of interest (KDE):");
+                for (int i = 0; i < SEindex.Length; i++)
+                {
+                    var x = settlement.xValues[SEindex[i]];
+                    Console.WriteLine($"${Math.Round(x)} ({DiffPerc((double)underlyingPrice, x)})");
+                }
+                */
+
+                Console.WriteLine();
+                Console.WriteLine("Press ENTER to return to datetime selection.");
                 try
                 {
                     await Task.Delay(60 * 1000, shouldExit.Token);
@@ -137,7 +156,12 @@ namespace BybitOptionsProbabilityCalculator
             }
         }
 
-        private static void GeneratePriceRangeLikelihood(List<BybitOptionTicker> options, bool deltaOrModel = false)
+        public static double DiffPerc(double a, double b)
+        {
+            return Math.Round((b - a) / a * 100, 2);
+        }
+
+        private static (double kdeEstimation, double[] xValues, double[] kdeValues) GeneratePriceRangeLikelihood(List<BybitOptionTicker> options, bool deltaOrModel = false)
         {
             // only keep CALLS
             var opt = options.Where(t => ParseOption(t.Symbol).Item3 == 'C').ToList();
@@ -187,8 +211,18 @@ namespace BybitOptionsProbabilityCalculator
                 var first = normal_probs.ElementAt(i);
                 var second = normal_probs.ElementAt(i + 1);
 
+                if (underlyingPrice >= first.Key && underlyingPrice <= second.Key && deltaOrModel)
+                {
+                    continue; // skip it for touch probability to avoid skewing the chart
+                }
+
                 var interval = $"${first.Key}-${second.Key}";
-                var prob = Math.Abs(first.Value - second.Value);
+                var rangeSize = second.Key - first.Key;
+                var prob = Math.Abs(first.Value - second.Value) / (double)rangeSize;
+                if (Math.Abs(first.Value - second.Value) == 0 && deltaOrModel)
+                {
+                    prob = 1.0d / (double)rangeSize;
+                }
 
                 intervalProbabilities.Add(interval, prob);
             }
@@ -222,7 +256,7 @@ namespace BybitOptionsProbabilityCalculator
             plt.Axes.Bottom.MinimumSize = 120;
 
             // Set Y-axis
-            plt.Axes.Left.Label.Text = "Probability (%)";
+            plt.Axes.Left.Label.Text = "Probability per $ (%)";
             plt.Axes.Left.Min = 0;
             plt.Axes.Margins(bottom: 0);
 
@@ -244,8 +278,17 @@ namespace BybitOptionsProbabilityCalculator
             line.LabelAlignment = Alignment.UpperCenter;
             line.LabelOppositeAxis = true;
 
+            // additionally, plot KDE distribution
+            // first, map X values to the first chart
+            var kdeXValues = kde.xValues.Select((x) => AlignXOnChart(normal_probs.Select((z) => z.Key).ToList(), (decimal)x)).ToArray();
+            var kdePlot = plt.Add.Scatter(kdeXValues, kde.kdeValues);
+            kdePlot.MarkerStyle.IsVisible = false;
+            kdePlot.LineStyle.Width = 2;
+
             // Render and show plot
             plt.SavePng($"interval_probabilities_{deltaOrModel}.png", 1920, 1080);
+
+            return (kdeMLP, kde.xValues, kde.kdeValues);
         }
 
         public static double AlignXOnChart(List<decimal> values, decimal value)
@@ -304,13 +347,13 @@ namespace BybitOptionsProbabilityCalculator
             return sorted;
         }
 
-        public static (double[] xValues, double[] kdeValues) KDE((double, double)[] values)
+        public static (double[] xValues, double[] kdeValues) KDE((double, double)[] values, int k = 2)
         {
-            // Fit Kernel Density Estimation (KDE) using linear interpolation
+            // Extract prices and cumulative probabilities
             var prices = values.Select(d => d.Item1).ToArray();
             var cumulativeProbs = values.Select(d => d.Item2).ToArray();
 
-            // Compute PMF (absolute difference of cumulative probabilities)
+            // Compute the probability mass function (PMF) from cumulative probabilities
             var pmf = new double[cumulativeProbs.Length - 1];
             for (int i = 0; i < pmf.Length; i++)
             {
@@ -318,15 +361,36 @@ namespace BybitOptionsProbabilityCalculator
             }
             var pmfPrices = prices.Take(prices.Length - 1).ToArray();
 
-            var interpolator = LinearSpline.InterpolateSorted(pmfPrices, pmf);
+            // Define KDE evaluation points
             double[] xValues = Enumerable.Range(0, 1000)
                                 .Select(i => prices.Min() + i * (prices.Max() - prices.Min()) / 999.0)
                                 .ToArray();
 
-            var kdeProbs = xValues.Select(x => interpolator.Interpolate(x)).ToArray();
+            // Compute adaptive bandwidths using k-nearest neighbors
+            double[] bandwidths = new double[pmfPrices.Length];
+            for (int i = 0; i < pmfPrices.Length; i++)
+            {
+                var distances = pmfPrices.Select(p => Math.Abs(p - pmfPrices[i])).Where(d => d > 0).OrderBy(d => d).ToArray();
+                bandwidths[i] = (distances.Length >= k ? distances[k - 1] : distances.LastOrDefault(5000)) * 0.8d; // Default bandwidth if insufficient neighbors
+            }
 
-            return (xValues, kdeProbs);
+            // Compute KDE using adaptive bandwidths
+            double[] kdeValues = xValues.Select(x =>
+            {
+                double density = 0.0;
+                for (int i = 0; i < pmfPrices.Length; i++)
+                {
+                    double h = bandwidths[i]; // Adaptive bandwidth for this data point
+                    double exponent = -0.5 * Math.Pow((x - pmfPrices[i]) / h, 2);
+                    double gaussianKernel = (1.0 / (h * Math.Sqrt(2 * Math.PI))) * Math.Exp(exponent);
+                    density += pmf[i] * gaussianKernel;
+                }
+                return density;
+            }).ToArray();
+
+            return (xValues, kdeValues);
         }
+
 
         public static double Ptouch(BybitOptionTicker option, decimal s0)
         {
